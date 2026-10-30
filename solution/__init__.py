@@ -15,8 +15,10 @@ The rules in short (the README and the task statement have the full ones):
 
 from .swiglu import patch_qwen2_mlp
 from .rmsnorm import patch_qwen2_rmsnorm
+from .fused_cross_entropy import patch_cross_entropy
 
 
 def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
-    patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward+backward, see rmsnorm.py
+    patch_qwen2_rmsnorm()  # Dev: fused RMSNorm forward+backward, see rmsnorm.py
+    patch_cross_entropy()  # ML: fused cross-entropy over the 151,936-token vocabulary
