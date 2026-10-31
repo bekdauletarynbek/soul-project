@@ -13,6 +13,8 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+import os
+
 from .swiglu import patch_qwen2_mlp
 from .rmsnorm import patch_qwen2_rmsnorm
 from .fused_cross_entropy import patch_cross_entropy
@@ -20,11 +22,28 @@ from .rope import patch_qwen2_rope
 from .residual_add import patch_qwen2_decoder_layer
 from .fused_lora import patch_lora
 
+# Debug-only bisection switch, OFF by default: SOUP_DISABLE_KERNELS=rope,lora (comma-separated)
+# skips those patches so a jury/team run can isolate which kernel a regression comes from without
+# a new commit per combination. Unset (the jury's and the default Kaggle run's case) applies every
+# patch below exactly as before -- this changes nothing about the submitted behavior by default.
+_OPTIONAL_PATCHES = {
+    "rmsnorm": patch_qwen2_rmsnorm,       # Dev
+    "cross_entropy": patch_cross_entropy,  # ML
+    "rope": patch_qwen2_rope,             # Dev
+    "residual_add": patch_qwen2_decoder_layer,  # Dev
+    "lora": patch_lora,                   # ML
+}
+
 
 def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
-    patch_qwen2_rmsnorm()  # Dev: fused RMSNorm forward+backward, see rmsnorm.py
-    patch_cross_entropy()  # ML: fused cross-entropy over the 151,936-token vocabulary
-    patch_qwen2_rope()  # Dev: fused RoPE forward+backward, see rope.py
-    patch_qwen2_decoder_layer()  # Dev: fused residual add, see residual_add.py
-    patch_lora()  # ML: fused LoRA projection (q_proj/v_proj), see fused_lora.py
+    disabled = {name for name in os.environ.get("SOUP_DISABLE_KERNELS", "").split(",") if name}
+    unknown = disabled - set(_OPTIONAL_PATCHES)
+    if unknown:
+        raise ValueError(f"SOUP_DISABLE_KERNELS: unknown kernel name(s) {sorted(unknown)}, "
+                         f"expected a subset of {sorted(_OPTIONAL_PATCHES)}")
+    for name, patch_fn in _OPTIONAL_PATCHES.items():
+        if name not in disabled:
+            patch_fn()
+    if disabled:
+        print(f"[solution] SOUP_DISABLE_KERNELS active, skipped: {sorted(disabled)}")
