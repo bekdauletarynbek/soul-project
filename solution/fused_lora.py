@@ -131,17 +131,25 @@ class _FusedLoRA(torch.autograd.Function):
         m_rows, in_features = x.shape
         r = weight_a.shape[0]
 
-        # Weight gradients: shared across every row, reduced over the whole (micro-)batch -- a
-        # plain, well-tested matmul rather than a Triton kernel with atomics into a buffer this
-        # small (r=16 wide).
-        grad_h = (grad_out.float() @ weight_b.float()) * scaling          # (m_rows, r)
-        grad_weight_a = grad_h.t() @ x.float()                            # (r, in_features)
-        grad_weight_b = (grad_out.float() * scaling).t() @ h              # (out_features, r)
+        # The reference (plain lora_B(lora_A(x))*scaling, two real nn.Linear layers) rounds its
+        # A-output to the working dtype (fp16) before B ever sees it, and B's backward produces a
+        # fp16-rounded grad w.r.t. that same A-output before A's backward uses it in turn -- two
+        # rounding points our forward kernel's fp32 `h` and this fp32 `grad_h` skip by computing
+        # everything in one higher-precision pass. Mathematically closer to the true gradient, but
+        # not bit-for-bit what torch.testing.assert_close checks against: rounding h and grad_h to
+        # weight_b/weight_a's dtype here, at the same two points the real two-nn.Linear chain
+        # would, matches it instead (found via the real Kaggle T4 run: weight-gradient mismatches
+        # of up to 1.3% of elements in fp16, forward and grad_x both already within tolerance).
+        h_cast = h.to(weight_b.dtype)
+        grad_h = ((grad_out.float() @ weight_b.float()) * scaling).to(weight_a.dtype)  # (m_rows, r)
+        grad_weight_a = grad_h.float().t() @ x.float()                    # (r, in_features)
+        grad_weight_b = (grad_out.float() * scaling).t() @ h_cast.float()  # (out_features, r)
 
         grad_x = torch.empty_like(x)
         block_r = triton.next_power_of_2(r)
+        grad_h = grad_h.contiguous()
         _lora_bwd_x_kernel[(m_rows,)](
-            grad_h.contiguous(), weight_a, grad_x, in_features, r,
+            grad_h, weight_a, grad_x, in_features, r,
             grad_h.stride(0), weight_a.stride(0), weight_a.stride(1), grad_x.stride(0),
             grad_x.stride(1), BLOCK_K=128, BLOCK_R=block_r,
         )
