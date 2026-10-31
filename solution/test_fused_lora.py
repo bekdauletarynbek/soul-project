@@ -21,8 +21,11 @@ def test_fused_lora_matches_pytorch(dtype, rows, in_features, out_features, r):
     torch.manual_seed(0)
     scaling = 2.0  # lora_alpha / r = 32 / 16, task.yaml's actual LoRA config
     x = torch.randn(rows, in_features, device="cuda", dtype=dtype, requires_grad=True)
-    weight_a = torch.randn(r, in_features, device="cuda", dtype=dtype, requires_grad=True) * 0.02
-    weight_b = torch.randn(out_features, r, device="cuda", dtype=dtype, requires_grad=True) * 0.02
+    # Scale BEFORE requires_grad_(): `randn(..., requires_grad=True) * 0.02` makes the *scaled*
+    # tensor a non-leaf (the output of a multiply), so backward() never populates its .grad --
+    # exactly the `AttributeError: 'NoneType' object has no attribute 'clone'` this used to hit.
+    weight_a = (torch.randn(r, in_features, device="cuda", dtype=dtype) * 0.02).requires_grad_()
+    weight_b = (torch.randn(out_features, r, device="cuda", dtype=dtype) * 0.02).requires_grad_()
     grad_out = torch.randn(rows, out_features, device="cuda", dtype=dtype)
 
     ref = torch.nn.functional.linear(torch.nn.functional.linear(x, weight_a), weight_b) * scaling
