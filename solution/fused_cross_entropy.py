@@ -30,7 +30,11 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_V = 4096  # vocab tile; 151,936 / 4096 ~= 38 tiles, keeps each block's registers small
+BLOCK_V = 8192  # vocab tile; 151,936 / 8192 ~= 19 tiles (was 4096/~38) -- fewer, bigger loop
+# iterations per row program: same masking/math at any tile size (correctness unaffected,
+# same unit tests), tried as a speed-only experiment on an already-working kernel. T4 has
+# enough registers per block for this (each thread in the block only holds a BLOCK_V/num_threads
+# slice at a time, not the whole tile) -- not validated on a real GPU yet, see WORK_LOGS.
 
 _ORIGINAL_FOR_CAUSAL_LM_LOSS = None  # filled in by patch_cross_entropy(), used as the CPU fallback
 
