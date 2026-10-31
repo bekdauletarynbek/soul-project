@@ -50,6 +50,10 @@ import triton.language as tl
 BLOCK_K = 256
 BLOCK_O = 256
 
+NUM_WARPS = 8  # Triton launch config, not a kernel argument -- see fused_cross_entropy.py's
+# NUM_WARPS comment, same reasoning (real per-tile reduction work, default 4 -> 8). Zero
+# correctness risk: Triton guarantees identical results at any num_warps.
+
 _ORIGINAL_LINEAR4BIT_FORWARD = None  # filled in by patch_lora(), used for every branch but vanilla
 
 
@@ -124,7 +128,7 @@ class _FusedLoRA(torch.autograd.Function):
             x, weight_a, weight_b, h, out, scaling, in_features, out_features, r,
             x.stride(0), x.stride(1), weight_a.stride(0), weight_a.stride(1),
             weight_b.stride(0), weight_b.stride(1), h.stride(0), out.stride(0), out.stride(1),
-            BLOCK_K=BLOCK_K, BLOCK_R=block_r, BLOCK_O=BLOCK_O,
+            BLOCK_K=BLOCK_K, BLOCK_R=block_r, BLOCK_O=BLOCK_O, num_warps=NUM_WARPS,
         )
         ctx.save_for_backward(x, weight_a, weight_b, h)
         ctx.scaling = scaling
@@ -158,7 +162,7 @@ class _FusedLoRA(torch.autograd.Function):
         _lora_bwd_x_kernel[(m_rows,)](
             grad_h, weight_a, grad_x, in_features, r,
             grad_h.stride(0), weight_a.stride(0), weight_a.stride(1), grad_x.stride(0),
-            grad_x.stride(1), BLOCK_K=BLOCK_K, BLOCK_R=block_r,
+            grad_x.stride(1), BLOCK_K=BLOCK_K, BLOCK_R=block_r, num_warps=NUM_WARPS,
         )
         return (grad_x, grad_weight_a.to(weight_a.dtype), grad_weight_b.to(weight_b.dtype), None)
 

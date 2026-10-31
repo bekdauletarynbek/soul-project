@@ -36,6 +36,13 @@ BLOCK_V = 8192  # vocab tile; 151,936 / 8192 ~= 19 tiles (was 4096/~38) -- fewer
 # enough registers per block for this (each thread in the block only holds a BLOCK_V/num_threads
 # slice at a time, not the whole tile) -- not validated on a real GPU yet, see WORK_LOGS.
 
+NUM_WARPS = 8  # Triton launch config, not a kernel argument: how many warps cooperate on one
+# program's BLOCK_V-wide load/reduce (default is 4). Purely a scheduling/occupancy hint -- Triton
+# guarantees the same result at any num_warps, zero correctness risk, unlike the tile-size change
+# above. More warps should help here specifically because each program does real parallel-
+# reducible work per tile (a tl.max and a tl.sum over BLOCK_V elements), not just sequential
+# control flow.
+
 _ORIGINAL_FOR_CAUSAL_LM_LOSS = None  # filled in by patch_cross_entropy(), used as the CPU fallback
 
 
@@ -102,7 +109,7 @@ class _FusedCrossEntropy(torch.autograd.Function):
         loss = torch.empty(n_rows, device=logits.device, dtype=torch.float32)
         lse = torch.empty(n_rows, device=logits.device, dtype=torch.float32)
         _ce_fwd_kernel[(n_rows,)](logits, targets, loss, lse, logits.stride(0), vocab_size,
-                                  ignore_index, BLOCK_V=BLOCK_V)
+                                  ignore_index, BLOCK_V=BLOCK_V, num_warps=NUM_WARPS)
         ctx.save_for_backward(logits, targets, lse)
         ctx.ignore_index = ignore_index
         return loss
@@ -113,7 +120,8 @@ class _FusedCrossEntropy(torch.autograd.Function):
         n_rows, vocab_size = logits.shape
         grad_logits = torch.empty_like(logits)
         _ce_bwd_kernel[(n_rows,)](logits, targets, lse, grad_loss.contiguous(), grad_logits,
-                                  logits.stride(0), vocab_size, ctx.ignore_index, BLOCK_V=BLOCK_V)
+                                  logits.stride(0), vocab_size, ctx.ignore_index, BLOCK_V=BLOCK_V,
+                                  num_warps=NUM_WARPS)
         return grad_logits, None, None
 
 
