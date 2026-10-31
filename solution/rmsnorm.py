@@ -61,13 +61,22 @@ def _rmsnorm_bwd_kernel(dy_ptr, x_ptr, weight_ptr, rstd_ptr, dx_ptr, dw_ptr, n_c
     xhat = x * rstd
     g = dy * w
     # d(xhat_i)/d(x_k) = rstd * (delta_ik - xhat_i * xhat_k / n_cols) -- standard RMSNorm
-    # backward (same identity used by Llama/Unsloth-style fused RMSNorm kernels).
+    # backward (same identity used by Llama/Unsloth-style fused RMSNorm kernels). dx does not
+    # go through the `.to(input_dtype)` cast below (a dtype cast's backward is a lossless
+    # pass-through in autograd), so it correctly uses the full-precision xhat.
     mean_g_xhat = tl.sum(g * xhat, axis=0) / n_cols
     dx = rstd * (g - xhat * mean_g_xhat)
     tl.store(dx_ptr + row * n_cols + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
     if COMPUTE_DW:
-        tl.atomic_add(dw_ptr + cols, dy * xhat, mask=mask)
+        # The reference rounds xhat to the input dtype BEFORE multiplying by weight
+        # (`weight * hidden_states.to(input_dtype)`), so dweight = dy * xhat is only correct
+        # per the chain rule if xhat is rounded the same way first -- using the full-precision
+        # xhat here (as an earlier version did) silently disagreed with the real autograd graph
+        # whenever the compute dtype loses precision relative to fp32 (fp16: ~0.1% per value,
+        # enough to show up as a multi-percent mismatch after summing over every row).
+        xhat_rounded = xhat.to(x_ptr.dtype.element_ty).to(tl.float32)
+        tl.atomic_add(dw_ptr + cols, dy * xhat_rounded, mask=mask)
 
 
 class _RMSNorm(torch.autograd.Function):
