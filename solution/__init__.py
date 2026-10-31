@@ -47,3 +47,15 @@ def apply():
             patch_fn()
     if disabled:
         print(f"[solution] SOUP_DISABLE_KERNELS active, skipped: {sorted(disabled)}")
+
+    # Debug-only, OFF by default: SOUP_DEBUG_ANOMALY=1 turns on
+    # torch.autograd.set_detect_anomaly(True), which makes autograd raise *at the exact
+    # backward op* that first produces a NaN/inf, with a stack trace pointing at the forward
+    # call that created it -- the direct way to localize an intermittent NaN (this run: loss=0
+    # on 61/64 steps, a real finite loss+entropy on steps 5/18/19, grad_norm nan nearly always
+    # -- not a deterministic math error, so comparing formulas on paper has stopped being
+    # useful). Slower and more verbose, so never on by default; does not change what trains.
+    if os.environ.get("SOUP_DEBUG_ANOMALY") == "1":
+        import torch
+        torch.autograd.set_detect_anomaly(True)
+        print("[solution] SOUP_DEBUG_ANOMALY=1: torch.autograd.set_detect_anomaly(True)")
