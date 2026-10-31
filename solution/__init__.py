@@ -18,6 +18,7 @@ from .rmsnorm import patch_qwen2_rmsnorm
 from .fused_cross_entropy import patch_cross_entropy
 from .rope import patch_qwen2_rope
 from .residual_add import patch_qwen2_decoder_layer
+from .fused_lora import patch_lora
 
 
 def apply():
@@ -26,3 +27,4 @@ def apply():
     patch_cross_entropy()  # ML: fused cross-entropy over the 151,936-token vocabulary
     patch_qwen2_rope()  # Dev: fused RoPE forward+backward, see rope.py
     patch_qwen2_decoder_layer()  # Dev: fused residual add, see residual_add.py
+    patch_lora()  # ML: fused LoRA projection (q_proj/v_proj), see fused_lora.py
