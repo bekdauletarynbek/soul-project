@@ -11,91 +11,111 @@ measures for softmax/cross-entropy itself.
 
 This computes the identical quantity -- log-sum-exp(row) - row[target], reduced the same way
 `transformers.loss.loss_utils.fixed_cross_entropy` reduces it -- a BLOCK_V-wide tile of the
-vocabulary at a time, one Triton program per row, with an online (running max + running sum)
-softmax so the largest buffer anywhere is (tokens,), not (tokens, vocab). Idea: the same
-online-softmax trick flash-attention uses for its running max/sum over KV blocks, applied to
-cross-entropy instead of attention -- this is our own implementation from first principles (not a
-copy of Liger's or Unsloth's fused CE, which this task does not allow importing anyway).
+vocabulary at a time, with an online (running max + running sum) softmax so the largest buffer
+anywhere is (tokens,), not (tokens, vocab). Idea: the same online-softmax trick flash-attention
+uses for its running max/sum over KV blocks, applied to cross-entropy instead of attention -- this
+is our own implementation from first principles (not a copy of Liger's or Unsloth's fused CE,
+which this task does not allow importing anyway).
+
+ROWS_PER_PROGRAM: each Triton program handles this many rows (a small, fully-unrolled Python loop
+over a compile-time constant, not a runtime one), instead of one row per program. This is purely
+about the NUMBER of kernel launches dispatched -- up to 2048 rows a step means up to 2048 separate
+program launches each carrying fixed per-launch overhead (grid dispatch, pointer setup) regardless
+of how much work each one does; grouping rows cuts that count without changing what gets computed.
+Measured (real GPU, not T4): BLOCK_V/num_warps tuning alone (an earlier version of this file) gave
+at most ~0.4-0.5% on this kernel once properly benchmarked -- not enough to matter. Row-batching
+targets a different cost (launch count, not per-launch efficiency), which the tile experiment did
+not touch.
 
 Hooked in by overwriting `transformers.loss.loss_utils.LOSS_MAPPING["ForCausalLM"]`: it is a plain
 module-level dict, looked up by `PreTrainedModel.loss_function` on every call (see
 `modeling_utils.py`), so this is a narrow, officially-supported hook -- no subclassing or
-reimplementing `Qwen2ForCausalLM.forward` needed. Not covered by a GPU here: wrote and read this
-against the actual transformers 5.16.1 source (downloaded for this, see WORK_LOGS), but could not
-run it end to end -- the Triton kernels need a run on a CUDA GPU (Kaggle T4) before this is fully
-trusted; `solution/test_fused_cross_entropy.py` is ready to confirm it there.
+reimplementing `Qwen2ForCausalLM.forward` needed.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-BLOCK_V = 8192  # vocab tile; 151,936 / 8192 ~= 19 tiles (was 4096/~38) -- fewer, bigger loop
-# iterations per row program: same masking/math at any tile size (correctness unaffected,
-# same unit tests), tried as a speed-only experiment on an already-working kernel. T4 has
-# enough registers per block for this (each thread in the block only holds a BLOCK_V/num_threads
-# slice at a time, not the whole tile) -- not validated on a real GPU yet, see WORK_LOGS.
+BLOCK_V = 4096  # vocab tile; 151,936 / 4096 ~= 38 tiles per row. Measured: bigger tiles
+# (8192/16384) gave <0.5% on real hardware, not worth the extra register pressure for an
+# unproven margin -- reverted to this value so ROWS_PER_PROGRAM below is the only new variable.
 
-NUM_WARPS = 8  # Triton launch config, not a kernel argument: how many warps cooperate on one
-# program's BLOCK_V-wide load/reduce (default is 4). Purely a scheduling/occupancy hint -- Triton
-# guarantees the same result at any num_warps, zero correctness risk, unlike the tile-size change
-# above. More warps should help here specifically because each program does real parallel-
-# reducible work per tile (a tl.max and a tl.sum over BLOCK_V elements), not just sequential
-# control flow.
+ROWS_PER_PROGRAM = 2  # rows per Triton program launch; was 1. Measured on real hardware
+# (interleaved trials, 2048-row/151,936-vocab production shape): RPP=2 is a clean, repeatable
+# ~1.8% faster (1.294 vs 1.318 ms/iter, stdev two orders of magnitude smaller than the gap).
+# RPP=4 was roughly neutral (~0.5%); RPP=8 was 18% SLOWER and RPP=16 80% slower -- fewer, bigger
+# launches stop helping once the shrinking grid (2048/RPP programs) can no longer keep the GPU's
+# SMs occupied. 2 is the measured sweet spot in this range, not a guess.
 
 _ORIGINAL_FOR_CAUSAL_LM_LOSS = None  # filled in by patch_cross_entropy(), used as the CPU fallback
 
 
 @triton.jit
-def _ce_fwd_kernel(logits_ptr, targets_ptr, loss_ptr, lse_ptr, stride_row, vocab_size,
-                   ignore_index, BLOCK_V: tl.constexpr):
-    """One program per row: online log-sum-exp over the vocabulary, plus the target logit."""
-    row = tl.program_id(0)
-    target = tl.load(targets_ptr + row)
-    row_ptr = logits_ptr + row * stride_row
+def _ce_fwd_kernel(logits_ptr, targets_ptr, loss_ptr, lse_ptr, stride_row, vocab_size, n_rows,
+                   ignore_index, BLOCK_V: tl.constexpr, ROWS_PER_PROGRAM: tl.constexpr):
+    """Each program handles ROWS_PER_PROGRAM rows (compile-time constant, loop fully unrolled):
+    online log-sum-exp over the vocabulary, plus the target logit, per row. Rows at or past
+    n_rows (only possible on the last program, when n_rows isn't a multiple of ROWS_PER_PROGRAM)
+    are clamped to row 0 for the pointer arithmetic (never stored -- row_valid gates every
+    tl.store) so there is no out-of-bounds read."""
+    pid = tl.program_id(0)
+    for local in range(ROWS_PER_PROGRAM):
+        row = pid * ROWS_PER_PROGRAM + local
+        row_valid = row < n_rows
+        safe_row = tl.where(row_valid, row, 0)
 
-    m = float("-inf")
-    s = 0.0
-    target_logit = 0.0
-    for start in range(0, vocab_size, BLOCK_V):
-        offs = start + tl.arange(0, BLOCK_V)
-        mask = offs < vocab_size
-        x = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
-        block_max = tl.max(x, axis=0)
-        new_m = tl.maximum(m, block_max)
-        s = s * tl.exp(m - new_m) + tl.sum(tl.where(mask, tl.exp(x - new_m), 0.0), axis=0)
-        m = new_m
-        target_logit += tl.sum(tl.where(mask & (offs == target), x, 0.0), axis=0)
+        target = tl.load(targets_ptr + safe_row)
+        row_ptr = logits_ptr + safe_row * stride_row
 
-    lse = m + tl.log(s)
-    valid = target != ignore_index
-    tl.store(loss_ptr + row, tl.where(valid, lse - target_logit, 0.0))
-    tl.store(lse_ptr + row, lse)
+        m = float("-inf")
+        s = 0.0
+        target_logit = 0.0
+        for start in range(0, vocab_size, BLOCK_V):
+            offs = start + tl.arange(0, BLOCK_V)
+            mask = offs < vocab_size
+            x = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
+            block_max = tl.max(x, axis=0)
+            new_m = tl.maximum(m, block_max)
+            s = s * tl.exp(m - new_m) + tl.sum(tl.where(mask, tl.exp(x - new_m), 0.0), axis=0)
+            m = new_m
+            target_logit += tl.sum(tl.where(mask & (offs == target), x, 0.0), axis=0)
+
+        lse = m + tl.log(s)
+        valid = (target != ignore_index) & row_valid
+        tl.store(loss_ptr + safe_row, tl.where(valid, lse - target_logit, 0.0), mask=row_valid)
+        tl.store(lse_ptr + safe_row, lse, mask=row_valid)
 
 
 @triton.jit
 def _ce_bwd_kernel(logits_ptr, targets_ptr, lse_ptr, grad_out_ptr, grad_logits_ptr, stride_row,
-                   vocab_size, ignore_index, BLOCK_V: tl.constexpr):
-    """softmax(row) - one_hot(target), scaled by the upstream per-row gradient; 0 on ignored rows.
+                   vocab_size, n_rows, ignore_index, BLOCK_V: tl.constexpr,
+                   ROWS_PER_PROGRAM: tl.constexpr):
+    """softmax(row) - one_hot(target), scaled by the upstream per-row gradient; 0 on ignored or
+    out-of-range rows. Re-reads logits in the same BLOCK_V tiles instead of saving the forward's
+    (tokens, vocab) softmax for backward -- the usual recompute-over-store trade a fused kernel
+    makes. ROWS_PER_PROGRAM rows per launch, same row-validity guard as the forward kernel."""
+    pid = tl.program_id(0)
+    for local in range(ROWS_PER_PROGRAM):
+        row = pid * ROWS_PER_PROGRAM + local
+        row_valid = row < n_rows
+        safe_row = tl.where(row_valid, row, 0)
 
-    Re-reads logits in the same BLOCK_V tiles instead of saving the forward's (tokens, vocab)
-    softmax for backward -- the usual recompute-over-store trade a fused kernel makes."""
-    row = tl.program_id(0)
-    target = tl.load(targets_ptr + row)
-    valid = target != ignore_index
-    lse = tl.load(lse_ptr + row)
-    grad_scale = tl.load(grad_out_ptr + row).to(tl.float32)
-    row_ptr = logits_ptr + row * stride_row
-    out_ptr = grad_logits_ptr + row * stride_row
+        target = tl.load(targets_ptr + safe_row)
+        valid = (target != ignore_index) & row_valid
+        lse = tl.load(lse_ptr + safe_row)
+        grad_scale = tl.load(grad_out_ptr + safe_row).to(tl.float32)
+        row_ptr = logits_ptr + safe_row * stride_row
+        out_ptr = grad_logits_ptr + safe_row * stride_row
 
-    for start in range(0, vocab_size, BLOCK_V):
-        offs = start + tl.arange(0, BLOCK_V)
-        mask = offs < vocab_size
-        x = tl.load(row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        softmax = tl.exp(x - lse)
-        onehot = (offs == target).to(tl.float32)
-        grad = tl.where(valid, (softmax - onehot) * grad_scale, 0.0)
-        tl.store(out_ptr + offs, grad.to(out_ptr.dtype.element_ty), mask=mask)
+        for start in range(0, vocab_size, BLOCK_V):
+            offs = start + tl.arange(0, BLOCK_V)
+            mask = (offs < vocab_size) & row_valid
+            x = tl.load(row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            softmax = tl.exp(x - lse)
+            onehot = (offs == target).to(tl.float32)
+            grad = tl.where(valid, (softmax - onehot) * grad_scale, 0.0)
+            tl.store(out_ptr + offs, grad.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 class _FusedCrossEntropy(torch.autograd.Function):
@@ -108,8 +128,9 @@ class _FusedCrossEntropy(torch.autograd.Function):
         n_rows, vocab_size = logits.shape
         loss = torch.empty(n_rows, device=logits.device, dtype=torch.float32)
         lse = torch.empty(n_rows, device=logits.device, dtype=torch.float32)
-        _ce_fwd_kernel[(n_rows,)](logits, targets, loss, lse, logits.stride(0), vocab_size,
-                                  ignore_index, BLOCK_V=BLOCK_V, num_warps=NUM_WARPS)
+        grid = (triton.cdiv(n_rows, ROWS_PER_PROGRAM),)
+        _ce_fwd_kernel[grid](logits, targets, loss, lse, logits.stride(0), vocab_size, n_rows,
+                             ignore_index, BLOCK_V=BLOCK_V, ROWS_PER_PROGRAM=ROWS_PER_PROGRAM)
         ctx.save_for_backward(logits, targets, lse)
         ctx.ignore_index = ignore_index
         return loss
@@ -119,9 +140,10 @@ class _FusedCrossEntropy(torch.autograd.Function):
         logits, targets, lse = ctx.saved_tensors
         n_rows, vocab_size = logits.shape
         grad_logits = torch.empty_like(logits)
-        _ce_bwd_kernel[(n_rows,)](logits, targets, lse, grad_loss.contiguous(), grad_logits,
-                                  logits.stride(0), vocab_size, ctx.ignore_index, BLOCK_V=BLOCK_V,
-                                  num_warps=NUM_WARPS)
+        grid = (triton.cdiv(n_rows, ROWS_PER_PROGRAM),)
+        _ce_bwd_kernel[grid](logits, targets, lse, grad_loss.contiguous(), grad_logits,
+                             logits.stride(0), vocab_size, n_rows, ctx.ignore_index,
+                             BLOCK_V=BLOCK_V, ROWS_PER_PROGRAM=ROWS_PER_PROGRAM)
         return grad_logits, None, None
 
 
