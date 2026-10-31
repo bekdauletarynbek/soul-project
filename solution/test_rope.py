@@ -26,26 +26,32 @@ def reference_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def make_cos_sin(batch, seq_len, head_dim, device, dtype):
+def make_cos_sin(cos_batch, seq_len, head_dim, device, dtype):
+    """cos_batch=1 reproduces what `Qwen2Model.forward` actually passes down when the caller
+    doesn't supply `position_ids` (TRL's SFTTrainer in unpacked mode never does): shape
+    (1, seq_len, head_dim), meant to broadcast over the real batch -- not pre-expanded to it.
+    Expanding it here (as an earlier version of this test did) would hide exactly the
+    out-of-bounds-read regression this test now exists to catch."""
     inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     pos = torch.arange(seq_len, device=device).float()
     freqs = torch.outer(pos, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos()[None, :, :].expand(batch, -1, -1).to(dtype).contiguous()
-    sin = emb.sin()[None, :, :].expand(batch, -1, -1).to(dtype).contiguous()
+    cos = emb.cos()[None, :, :].expand(cos_batch, -1, -1).to(dtype).contiguous()
+    sin = emb.sin()[None, :, :].expand(cos_batch, -1, -1).to(dtype).contiguous()
     return cos, sin
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("batch,q_heads,kv_heads,seq_len,head_dim", [
-    (2, 12, 2, 37, 128),  # Qwen2.5-1.5B-like shape (GQA), odd seq_len to force masking
-    (1, 2, 2, 8, 16),
+@pytest.mark.parametrize("batch,q_heads,kv_heads,seq_len,head_dim,cos_batch", [
+    (4, 12, 2, 37, 128, 1),  # Qwen2.5-1.5B-like shape (GQA) with the real cos/sin broadcast (batch 1)
+    (2, 12, 2, 37, 128, 2),  # the other legal case: position_ids given explicitly, cos/sin match batch
+    (1, 2, 2, 8, 16, 1),
 ])
-def test_rope_matches_pytorch(dtype, batch, q_heads, kv_heads, seq_len, head_dim):
+def test_rope_matches_pytorch(dtype, batch, q_heads, kv_heads, seq_len, head_dim, cos_batch):
     from solution.rope import rotary_embed
 
     torch.manual_seed(0)
-    cos, sin = make_cos_sin(batch, seq_len, head_dim, "cuda", dtype)
+    cos, sin = make_cos_sin(cos_batch, seq_len, head_dim, "cuda", dtype)
     q = torch.randn(batch, q_heads, seq_len, head_dim, device="cuda", dtype=dtype,
                     requires_grad=True)
     k = torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=dtype,

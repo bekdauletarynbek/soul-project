@@ -104,15 +104,30 @@ def _rope_bwd_kernel(dout_ptr, cos_ptr, sin_ptr, dx_ptr,
     tl.store(dx_row + half_dim + cols, dx2.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
+def _cos_batch_stride(cos, batch):
+    """cos/sin come in at `position_ids.shape[0]`, which `Qwen2Model.forward` sets to the real
+    batch size only if the caller passes `position_ids` explicitly. TRL's SFTTrainer (unpacked
+    mode, this task's setup) does not, so `Qwen2Model.forward` falls back to
+    `torch.arange(seq_len).unsqueeze(0)` -- batch 1 -- and relies on ordinary PyTorch
+    broadcasting (`q * cos.unsqueeze(1)`) to stretch it over the real batch. A stride of 0 does
+    the same thing by hand: `b * 0 == 0` for every b, so every program reads row 0 instead of
+    indexing past the single row actually allocated. Without this, forward silently read
+    out-of-bounds memory for every batch index beyond 0 (NaN from the very first step, not a
+    gradual drift -- caught by @ML bisecting on a real T4 run after RMSNorm+CE+RoPE alone
+    still produced NaN)."""
+    return cos.stride(0) if cos.shape[0] == batch else 0
+
+
 def _launch_fwd(x, cos, sin):
     b, h, s, d = x.shape
     half = d // 2
     block = triton.next_power_of_2(half)
     out = torch.empty_like(x)
+    stride_cb = _cos_batch_stride(cos, b)
     _rope_fwd_kernel[(b * h * s,)](
         x, cos, sin, out,
         x.stride(0), x.stride(1), x.stride(2),
-        cos.stride(0), cos.stride(1),
+        stride_cb, cos.stride(1),
         h, s, half, BLOCK=block,
     )
     return out
@@ -123,10 +138,11 @@ def _launch_bwd(dout, cos, sin, shape):
     half = d // 2
     block = triton.next_power_of_2(half)
     dx = torch.empty(shape, device=dout.device, dtype=dout.dtype)
+    stride_cb = _cos_batch_stride(cos, b)
     _rope_bwd_kernel[(b * h * s,)](
         dout, cos, sin, dx,
         dx.stride(0), dx.stride(1), dx.stride(2),
-        cos.stride(0), cos.stride(1),
+        stride_cb, cos.stride(1),
         h, s, half, BLOCK=block,
     )
     return dx
