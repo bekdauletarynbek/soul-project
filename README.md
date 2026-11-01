@@ -81,6 +81,13 @@ intermittent NaN to the exact backward call that produced it. Both are explained
   four — included to help clear the 5% floor (check 4) honestly, not presented as an
   optimization in itself.
 - Results above are from a single run on a single T4, not averaged over repeats.
+- **CE row-batching (`ROWS_PER_PROGRAM=2` in `fused_cross_entropy.py`, commit `9836cab`)**:
+  measured ~1.8% faster on a Blackwell dev pod (strict methodology — 5 shuffled repeats per
+  config, signal well above neighbor-process noise). Re-verified on the actual Kaggle T4 with
+  `--repeats 2`: the effect is smaller than the ~12% run-to-run noise on that GPU, so it does not
+  move check 4's speedup number. Kept in the solution anyway — it does not hurt any check, and
+  correctness is fully verified (29/29 tests, manual sweep over 1-2049 rows, forward+backward
+  matching `F.cross_entropy`).
 
 ## License
 

@@ -73,3 +73,12 @@ table, limitations) is the raw material.
 - Only a single run on a single T4 is reflected in the results table above (version 13); we did not
   average over multiple repeats for the numbers here, though check 4's 10.4% was confirmed as the
   lowest across the runs the harness itself did.
+- **CE row-batching (`ROWS_PER_PROGRAM=2` in `fused_cross_entropy.py`, commit `9836cab`,
+  `ml-block-tuning-experiment` branch)**: measured ~1.8% faster on a Blackwell dev pod (strict
+  methodology — 5 shuffled repeats per config, signal well above neighbor-process noise).
+  Re-verified on the actual Kaggle T4 with `--repeats 2`: the effect is smaller than the ~12%
+  run-to-run noise on that GPU, so it does not move the speedup number in check 4. Kept in the
+  solution anyway — it does not hurt any check, and correctness is fully verified (29/29 tests,
+  manual sweep over 1-2049 rows, forward+backward matching `F.cross_entropy`). Two other tuning
+  directions (bigger Triton tiles, `num_warps=8`, row-batching for the LoRA kernel) were tried and
+  measured as no real improvement, then reverted — not included here as a false "win".
