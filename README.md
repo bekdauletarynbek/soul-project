@@ -14,7 +14,7 @@ Decentrathon 6.0. Full results, team info and links: **[SUBMISSION.md](SUBMISSIO
 | Fused cross-entropy fwd+bwd | `solution/fused_cross_entropy.py` | `ForCausalLMLoss` — avoids upcasting the full (tokens, 151,936) logits to fp32 | 0.7% |
 | Fused LoRA projection fwd+bwd(x) | `solution/fused_lora.py` | `lora_B(lora_A(dropout(x))) * scaling` on q_proj/v_proj, 28 layers | 6.6% |
 
-**Total: 10.4%** of the training time is our own kernels (check 4 needs ≥5%).
+**Total: 10.7%** of the training time is our own kernels (check 4 needs ≥5%; re-verified at the current commit, see Results below — per-kernel shares in the table are from the original breakdown run and approximate).
 
 Each kernel's design and why it's safe to patch (including the exact transformers/peft/
 bitsandbytes source we verified against, not assumptions from memory) is documented in its own
@@ -28,18 +28,22 @@ The shipped example (`solution/swiglu.py`, fused SwiGLU) stays active alongside 
 not count as our kernel (per the rules), but keeping it running is allowed and it's part of why
 memory and time both improved.
 
-## Results (Kaggle T4, kernel version 13, commit `0ac7f34`)
+## Results (Kaggle T4, `--repeats 2`, commit `9836cab`)
+
+Averaged over 2 repeats each for base and solution (the harness's own honest methodology), not a
+single run:
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 90.59 | 81.43 | speedup x1.1125 |
+| Time of `soup train`, s | 91.88 | 89.55 | speedup x1.026 |
 | Peak GPU memory, MiB | 14345 | 11503 | base/ours x1.2471 |
-| Eval loss (public rows) | 2.04964 | 2.04968 | +0.002% vs base |
+| Eval loss (public rows) | 2.04961 | 2.04971 | +0.005% vs base |
 
-All 10 checks of `harness/check_rules.py` pass (`kaggle_push/output_v13/repo/runs/checks.json`).
-Everything since that verified commit (`0ac7f34`) is docs/tests only (this README, SUBMISSION.md,
-a test tolerance in `solution/test_fused_lora.py` — see `git diff 0ac7f34 HEAD --stat`), so the
-`solution/` code that actually trains is unchanged and this run is representative of what's
+All 10 checks of `harness/check_rules.py` pass
+(`kaggle_push_mltest/output_rpp2_verify/repo/runs/checks.json`); own kernels measured at 10.7% of
+the training time (check 4, lowest of the 2 runs). Training-relevant code at commit `9836cab` is
+byte-identical through the current `HEAD` — everything after it is docs only (this README,
+SUBMISSION.md — see `git diff 9836cab HEAD --stat`), so this run is representative of what's
 submitted.
 
 ## How to run it
@@ -80,14 +84,16 @@ intermittent NaN to the exact backward call that produced it. Both are explained
 - `residual_add.py`'s kernel is a plain elementwise add, not a multi-op fusion like the other
   four — included to help clear the 5% floor (check 4) honestly, not presented as an
   optimization in itself.
-- Results above are from a single run on a single T4, not averaged over repeats.
 - **CE row-batching (`ROWS_PER_PROGRAM=2` in `fused_cross_entropy.py`, commit `9836cab`)**:
   measured ~1.8% faster on a Blackwell dev pod (strict methodology — 5 shuffled repeats per
-  config, signal well above neighbor-process noise). Re-verified on the actual Kaggle T4 with
-  `--repeats 2`: the effect is smaller than the ~12% run-to-run noise on that GPU, so it does not
-  move check 4's speedup number. Kept in the solution anyway — it does not hurt any check, and
-  correctness is fully verified (29/29 tests, manual sweep over 1-2049 rows, forward+backward
-  matching `F.cross_entropy`).
+  config, signal well above neighbor-process noise). The Results table above already reflects
+  this on the real target GPU: x1.026 speedup, barely different from x1.034 measured on the same
+  T4 without this change (commit `ce3aa74`, see SUBMISSION.md history) — within the ~12%
+  run-to-run noise on a T4, so it doesn't move check 4's speedup number there. Kept in the
+  solution anyway since it doesn't hurt any check and correctness is fully verified (29/29 tests,
+  manual sweep over 1-2049 rows, forward+backward matching `F.cross_entropy`). Two other tuning
+  directions (bigger Triton tiles, `num_warps=8`, row-batching for the LoRA kernel) were tried and
+  measured as no real improvement, then reverted.
 
 ## License
 

@@ -1,10 +1,10 @@
 # Submission: <TODO: team name — fill in, we don't have it>
 
 ## Links
-- Repository, final commit: https://github.com/bekdauletarynbek/soul-project/commit/ce3aa74
-  (training-relevant code is byte-identical to commit `0ac7f34`, the one actually verified below —
-  `ce3aa74` only tightens a test's numeric tolerance in `solution/test_fused_lora.py`, see
-  `git diff 0ac7f34 ce3aa74 --stat`)
+- Repository, final commit: https://github.com/bekdauletarynbek/soul-project/commit/364e959
+  (`ml-block-tuning-experiment` merged into `main`; training-relevant code is byte-identical to
+  commit `9836cab`, the one actually verified below with `--repeats 2` on a real Kaggle T4 —
+  everything after `9836cab` is docs only, see `git diff 9836cab 364e959 --stat`)
 - Public Kaggle notebook, the saved version: **TODO — notebook is still private** (kernel
   `bekdauletarynbek/soup-kernel-challenge-run`, version 13 is the verified run below; needs
   `is_private: false` in `kaggle_push/kernel-metadata.json` + a push before submitting, and the
@@ -29,8 +29,9 @@
 | `_ce_fwd_kernel` / `_ce_bwd_kernel` | `solution/fused_cross_entropy.py` | `ForCausalLMLoss` (fp32 upcast of the full (tokens, 151936) logits) | 0.7% |
 | `_lora_fwd_kernel` / `_lora_bwd_x_kernel` | `solution/fused_lora.py` | `lora_B(lora_A(dropout(x))) * scaling` on q_proj/v_proj (28 layers) | 6.6% |
 
-Total: **10.4%** of the training time (check 4 needs ≥5%; measured on `runs/solution_1/metrics.json`,
-Kaggle kernel version 13, commit 0ac7f34).
+Total: **10.7%** of the training time (check 4 needs ≥5%; re-verified with `--repeats 2` on
+Kaggle, `kaggle_push_mltest/output_rpp2_verify/repo/runs/checks.json`, commit `9836cab` — per-kernel
+shares in the table above are from the original breakdown run and approximate).
 
 Ideas taken from other kernels, with links (we wrote the code ourselves):
 - Fused cross-entropy: online log-sum-exp over vocabulary tiles, the same running-max/running-sum
@@ -42,16 +43,18 @@ Ideas taken from other kernels, with links (we wrote the code ourselves):
   fused dequant+GEMM CUDA kernel, so this would mean out-racing a vendor-tuned GEMM blind, not
   writing a pointwise op; see `solution/NF4_RESEARCH.md`.
 
-## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json`, kernel version 13)
+## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json`, `--repeats 2`, commit `9836cab`)
+Averaged over 2 repeats each for base and solution, not a single run:
+
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 90.59 | 81.43 | speedup x1.1125 |
+| Time of `soup train`, s | 91.88 | 89.55 | speedup x1.026 |
 | Peak GPU memory, MiB | 14345 | 11503 | base/ours x1.2471 |
-| Eval loss (public rows) | 2.04964 | 2.04968 | +0.002% vs base |
+| Eval loss (public rows) | 2.04961 | 2.04971 | +0.005% vs base |
 
-- [x] All 10 checks of `harness/check_rules.py` passed (`kaggle_push/output_v13/repo/runs/checks.json`)
-- [ ] README.md rewritten for our solution: what we did, how to run it, results, limits —
-  **still the original starter README**, needs a rewrite before submitting (separate task)
+- [x] All 10 checks of `harness/check_rules.py` passed
+  (`kaggle_push_mltest/output_rpp2_verify/repo/runs/checks.json`)
+- [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
 ## Presentation covers
 Which operations you sped up and why, how the kernels work, results against the base (speed,
@@ -70,15 +73,13 @@ table, limitations) is the raw material.
   intermittent and not fully root-caused beyond the specific out-of-bounds read we found and fixed.
 - `residual_add.py`'s `_add_kernel` is a plain elementwise add, not a multi-op fusion like the other
   four — included honestly to help clear the 5% floor (check 4), not represented as an optimization.
-- Only a single run on a single T4 is reflected in the results table above (version 13); we did not
-  average over multiple repeats for the numbers here, though check 4's 10.4% was confirmed as the
-  lowest across the runs the harness itself did.
-- **CE row-batching (`ROWS_PER_PROGRAM=2` in `fused_cross_entropy.py`, commit `9836cab`,
-  `ml-block-tuning-experiment` branch)**: measured ~1.8% faster on a Blackwell dev pod (strict
-  methodology — 5 shuffled repeats per config, signal well above neighbor-process noise).
-  Re-verified on the actual Kaggle T4 with `--repeats 2`: the effect is smaller than the ~12%
-  run-to-run noise on that GPU, so it does not move the speedup number in check 4. Kept in the
-  solution anyway — it does not hurt any check, and correctness is fully verified (29/29 tests,
-  manual sweep over 1-2049 rows, forward+backward matching `F.cross_entropy`). Two other tuning
-  directions (bigger Triton tiles, `num_warps=8`, row-batching for the LoRA kernel) were tried and
-  measured as no real improvement, then reverted — not included here as a false "win".
+- **CE row-batching (`ROWS_PER_PROGRAM=2` in `fused_cross_entropy.py`, commit `9836cab`, now on
+  `main`)**: measured ~1.8% faster on a Blackwell dev pod (strict methodology — 5 shuffled repeats
+  per config, signal well above neighbor-process noise). The results table above already reflects
+  this on the real target GPU: x1.026 speedup, barely different from x1.034 measured on the same
+  T4 without this change (commit `ce3aa74`) — within the ~12% run-to-run noise on a T4, so it
+  doesn't move check 4's speedup number there. Kept in the solution anyway since it doesn't hurt
+  any check and correctness is fully verified (29/29 tests, manual sweep over 1-2049 rows,
+  forward+backward matching `F.cross_entropy`). Two other tuning directions (bigger Triton tiles,
+  `num_warps=8`, row-batching for the LoRA kernel) were tried and measured as no real improvement,
+  then reverted — not included here as a false "win".
